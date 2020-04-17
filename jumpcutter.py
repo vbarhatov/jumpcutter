@@ -90,7 +90,7 @@ def processVideo(inputFile, outputFile, tempDir):
         start = int(i * samplesPerFrame)
         end = min(int((i + 1) * samplesPerFrame), audioSampleCount)
         audiochunks = audioData[start:end]
-        maxchunksVolume = float(getMaxVolume(audiochunks)) / maxAudioVolume
+        maxchunksVolume = float(getMaxVolume(audiochunks)) / max(maxAudioVolume, 1e-10)
         if maxchunksVolume >= SILENT_THRESHOLD:
             hasLoudAudio[i] = 1
     chunks = [[0, 0, 0]]
