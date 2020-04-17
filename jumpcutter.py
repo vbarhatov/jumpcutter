@@ -19,7 +19,6 @@ def downloadFile(url):
     os.rename(originalPath, filepath)
     return filepath
 
-
 def getFrameRate(path):
     process = subprocess.Popen(["ffmpeg", "-i", path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     stdout, _ = process.communicate()
@@ -32,9 +31,9 @@ def getMaxVolume(s):
     minv = float(np.min(s))
     return max(maxv,-minv)
 
-def copyFrame(inputFrame,outputFrame):
-    src = TEMP_FOLDER+"/frame{:06d}".format(inputFrame+1)+".jpg"
-    dst = TEMP_FOLDER+"/newFrame{:06d}".format(outputFrame+1)+".jpg"
+def copyFrame(inputFrame, outputFrame, tempDir):
+    src = tempDir+"/frame{:06d}".format(inputFrame+1)+".jpg"
+    dst = tempDir+"/newFrame{:06d}".format(outputFrame+1)+".jpg"
     if not os.path.isfile(src):
         return False
     move(src, dst)
@@ -46,10 +45,11 @@ def inputToOutputFilename(filename):
     dotIndex = filename.rfind(".")
     return filename[:dotIndex]+"_ALTERED"+filename[dotIndex:]
 
-def createPath(s):
-
+def createTempDir(parentDir):
+    tempDir = parentDir + "/temp" + str(int(time()))
     try:  
-        os.mkdir(s)
+        os.mkdir(tempDir)
+        return tempDir
     except OSError:  
         assert False, "Creation of the directory %s failed. (The TEMP folder may already exist. Delete or rename it, and try again.)"
 
@@ -59,6 +59,122 @@ def deletePath(s): # Dangerous! Watch out!
     except OSError:  
         print ("Deletion of the directory %s failed" % s)
         print(OSError)
+
+def getVideoLengthSeconds(filename):
+    output = subprocess.check_output(("ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", filename)).strip()
+    return int(float(output))
+
+def copyVideoFragment(inputFile, outputFile, startSeconds, endSeconds):
+    # ffmpeg -i input.mp4 -vcodec copy -acodec copy -ss 0 -t 30 output.mp4
+    split_cmd = ["ffmpeg", "-i", inputFile, "-vcodec", "copy", "-acodec", "copy"]
+    if startSeconds > 0:
+        split_cmd.extend(["-ss", str(startSeconds)])
+    split_cmd.extend(["-t", str(endSeconds - startSeconds), outputFile])
+    subprocess.check_output(split_cmd)
+
+def processVideo(inputFile, outputFile, tempDir):
+    global frameRate
+    command = "ffmpeg -i '" + inputFile + "' -qscale:v " + str(FRAME_QUALITY) + " " + tempDir + "/frame%06d.jpg -hide_banner"
+    subprocess.call(command, shell=True)
+    command = "ffmpeg -i '" + inputFile + "' -ab 160k -ac 2 -ar " + str(SAMPLE_RATE) + " -vn " + tempDir + "/audio.wav"
+    subprocess.call(command, shell=True)
+    sampleRate, audioData = wavfile.read(tempDir + "/audio.wav")
+    audioSampleCount = audioData.shape[0]
+    maxAudioVolume = getMaxVolume(audioData)
+    if frameRate is None:
+        frameRate = getFrameRate(inputFile)
+    samplesPerFrame = sampleRate / frameRate
+    audioFrameCount = int(math.ceil(audioSampleCount / samplesPerFrame))
+    hasLoudAudio = np.zeros((audioFrameCount))
+    for i in range(audioFrameCount):
+        start = int(i * samplesPerFrame)
+        end = min(int((i + 1) * samplesPerFrame), audioSampleCount)
+        audiochunks = audioData[start:end]
+        maxchunksVolume = float(getMaxVolume(audiochunks)) / maxAudioVolume
+        if maxchunksVolume >= SILENT_THRESHOLD:
+            hasLoudAudio[i] = 1
+    chunks = [[0, 0, 0]]
+    shouldIncludeFrame = np.zeros((audioFrameCount))
+    for i in range(audioFrameCount):
+        start = int(max(0, i - FRAME_SPREADAGE))
+        end = int(min(audioFrameCount, i + 1 + FRAME_SPREADAGE))
+        shouldIncludeFrame[i] = np.max(hasLoudAudio[start:end])
+        if (i >= 1 and shouldIncludeFrame[i] != shouldIncludeFrame[i - 1]):  # Did we flip?
+            chunks.append([chunks[-1][1], i, shouldIncludeFrame[i - 1]])
+    chunks.append([chunks[-1][1], audioFrameCount, shouldIncludeFrame[i - 1]])
+    chunks = chunks[1:]
+    outputAudioData = []
+    outputPointer = 0
+    mask = [x / AUDIO_FADE_ENVELOPE_SIZE for x in range(AUDIO_FADE_ENVELOPE_SIZE)]  # Create audio envelope mask
+    lastExistingFrame = None
+    for chunk in chunks:
+        audioChunk = audioData[int(chunk[0] * samplesPerFrame):int(chunk[1] * samplesPerFrame)]
+
+        sFile = tempDir + "/tempStart.wav"
+        eFile = tempDir + "/tempEnd.wav"
+        wavfile.write(sFile, SAMPLE_RATE, audioChunk)
+        with WavReader(sFile) as reader:
+            with WavWriter(eFile, reader.channels, reader.samplerate) as writer:
+                tsm = audio_stretch_algorithm(reader.channels, speed=NEW_SPEED[int(chunk[2])])
+                tsm.run(reader, writer)
+        _, alteredAudioData = wavfile.read(eFile)
+        leng = alteredAudioData.shape[0]
+        endPointer = outputPointer + leng
+        outputAudioData.extend((alteredAudioData / maxAudioVolume).tolist())
+
+        # Smoothing the audio
+        if leng < AUDIO_FADE_ENVELOPE_SIZE:
+            for i in range(outputPointer, endPointer):
+                outputAudioData[i] = 0
+        else:
+            for i in range(outputPointer, outputPointer + AUDIO_FADE_ENVELOPE_SIZE):
+                outputAudioData[i][0] *= mask[i - outputPointer]
+                outputAudioData[i][1] *= mask[i - outputPointer]
+            for i in range(endPointer - AUDIO_FADE_ENVELOPE_SIZE, endPointer):
+                outputAudioData[i][0] *= (1 - mask[i - endPointer + AUDIO_FADE_ENVELOPE_SIZE])
+                outputAudioData[i][1] *= (1 - mask[i - endPointer + AUDIO_FADE_ENVELOPE_SIZE])
+
+        startOutputFrame = int(math.ceil(outputPointer / samplesPerFrame))
+        endOutputFrame = int(math.ceil(endPointer / samplesPerFrame))
+        for outputFrame in range(startOutputFrame, endOutputFrame):
+            inputFrame = int(chunk[0] + NEW_SPEED[int(chunk[2])] * (outputFrame - startOutputFrame))
+            didItWork = copyFrame(inputFrame, outputFrame, tempDir)
+            if didItWork:
+                lastExistingFrame = inputFrame
+            else:
+                copyFrame(lastExistingFrame, outputFrame, tempDir)
+
+        outputPointer = endPointer
+    outputAudioData = np.asarray(outputAudioData)
+    wavfile.write(tempDir + "/audioNew.wav", SAMPLE_RATE, outputAudioData)
+    command = f"ffmpeg -framerate {frameRate} -i {tempDir}/newFrame%06d.jpg -i {tempDir}/audioNew.wav -strict -2 -c:v libx264 -preset {H264_PRESET} -crf {H264_CRF} -pix_fmt yuvj420p '{outputFile}'"
+    subprocess.call(command, shell=True)
+
+
+def joinVideos(inputFiles, outputFile, tempDir):
+    # $ cat mylist.txt
+    # file '/path/to/file1'
+    # file '/path/to/file2'
+    # file '/path/to/file3'
+    #
+    # $ ffmpeg -f concat -safe 0 -i mylist.txt -c copy output.mp4
+    outputListPath = '{}/outputList.txt'.format(tempDir)
+    outputListFile = open(outputListPath, 'w+')
+    for file in inputFiles:
+        outputListFile.write('file \'{}\'\n'.format(file))
+    outputListFile.close()
+    joinCmd = ["ffmpeg", "-f", "concat", "-safe", "0", "-i", outputListPath, "-c", "copy", outputFile]
+    subprocess.check_output(joinCmd)
+    pass
+
+def joinVideos1(inputFiles, outputFile):
+    # e.g.: ffmpeg -i "concat:input1.mp4|input2.mp4|input3.mp4" -c copy output.mp4
+    joinedInputFiles = '|'.join(inputFiles)
+    split_cmd = ["ffmpeg", "-i", "concat:{}".format(joinedInputFiles), "-c", "copy", outputFile]
+    subprocess.check_output(split_cmd)
+    pass
+
+
 
 parser = argparse.ArgumentParser(description='Modifies a video file to play at different speeds when there is sound vs. silence.')
 parser.add_argument('-i', '--input_file', type=str,  help='the video file you want modified')
@@ -77,7 +193,6 @@ parser.add_argument('-sa', '--stretch_algorithm', type=str, default="wsola", hel
 
 
 args = parser.parse_args()
-
 
 
 frameRate = args.frame_rate
@@ -111,105 +226,35 @@ if len(args.output_file) >= 1:
 else:
     OUTPUT_FILE = inputToOutputFilename(INPUT_FILE)
 
-TEMP_FOLDER = "TEMP" + str(int(time()))
 AUDIO_FADE_ENVELOPE_SIZE = 400 # smooth out transitiion's audio by quickly fading in/out (arbitrary magic number whatever)
-    
-createPath(TEMP_FOLDER)
-
-command = "ffmpeg -i '"+INPUT_FILE+"' -qscale:v "+str(FRAME_QUALITY)+" "+TEMP_FOLDER+"/frame%06d.jpg -hide_banner"
-subprocess.call(command, shell=True)
-
-command = "ffmpeg -i '"+INPUT_FILE+"' -ab 160k -ac 2 -ar "+str(SAMPLE_RATE)+" -vn "+TEMP_FOLDER+"/audio.wav"
-
-subprocess.call(command, shell=True)
 
 
+tempDir = createTempDir("/tmp")
 
-sampleRate, audioData = wavfile.read(TEMP_FOLDER+"/audio.wav")
-audioSampleCount = audioData.shape[0]
-maxAudioVolume = getMaxVolume(audioData)
+partSizeSeconds = 600
+videoLengthSeconds = getVideoLengthSeconds(INPUT_FILE)
 
-if frameRate is None:
-    frameRate = getFrameRate(INPUT_FILE)
+if videoLengthSeconds < partSizeSeconds:
+    processVideo(INPUT_FILE, OUTPUT_FILE, tempDir)
+else:
+    videoPartStart = 0
+    i = 0
+    outputFileParts = []
+    while videoPartStart < videoLengthSeconds:
+        print('\n\nPROCESSING PART {}/{}\n\n'.format(i + 1, math.ceil(videoLengthSeconds / partSizeSeconds)))
+        partTempDir = createTempDir(tempDir)
+        videoPartEnd = min(videoLengthSeconds, videoPartStart + partSizeSeconds)
+        inputFilePart = "{}/inputPart.{:03d}.mp4".format(tempDir, i)
+        outputFilePart = "{}/outputPart.{:03d}.mp4".format(tempDir, i)
+        outputFileParts.append(outputFilePart)
+        copyVideoFragment(INPUT_FILE, inputFilePart, videoPartStart, videoPartEnd)
+        processVideo(inputFilePart, outputFilePart, partTempDir)
 
-samplesPerFrame = sampleRate/frameRate
+        videoPartStart = videoPartEnd
+        i += 1
 
-audioFrameCount = int(math.ceil(audioSampleCount/samplesPerFrame))
+        deletePath(partTempDir)
+    joinVideos(outputFileParts, OUTPUT_FILE, tempDir)
 
-hasLoudAudio = np.zeros((audioFrameCount))
-
-
-
-for i in range(audioFrameCount):
-    start = int(i*samplesPerFrame)
-    end = min(int((i+1)*samplesPerFrame),audioSampleCount)
-    audiochunks = audioData[start:end]
-    maxchunksVolume = float(getMaxVolume(audiochunks))/maxAudioVolume
-    if maxchunksVolume >= SILENT_THRESHOLD:
-        hasLoudAudio[i] = 1
-
-chunks = [[0,0,0]]
-shouldIncludeFrame = np.zeros((audioFrameCount))
-for i in range(audioFrameCount):
-    start = int(max(0,i-FRAME_SPREADAGE))
-    end = int(min(audioFrameCount,i+1+FRAME_SPREADAGE))
-    shouldIncludeFrame[i] = np.max(hasLoudAudio[start:end])
-    if (i >= 1 and shouldIncludeFrame[i] != shouldIncludeFrame[i-1]): # Did we flip?
-        chunks.append([chunks[-1][1],i,shouldIncludeFrame[i-1]])
-
-chunks.append([chunks[-1][1],audioFrameCount,shouldIncludeFrame[i-1]])
-chunks = chunks[1:]
-outputAudioData = []
-outputPointer = 0
-
-mask = [x/AUDIO_FADE_ENVELOPE_SIZE for x in range(AUDIO_FADE_ENVELOPE_SIZE)] # Create audio envelope mask
-
-lastExistingFrame = None
-for chunk in chunks:
-    audioChunk = audioData[int(chunk[0]*samplesPerFrame):int(chunk[1]*samplesPerFrame)]
-    
-    sFile = TEMP_FOLDER+"/tempStart.wav"
-    eFile = TEMP_FOLDER+"/tempEnd.wav"
-    wavfile.write(sFile,SAMPLE_RATE,audioChunk)
-    with WavReader(sFile) as reader:
-        with WavWriter(eFile, reader.channels, reader.samplerate) as writer:
-            tsm = audio_stretch_algorithm(reader.channels, speed=NEW_SPEED[int(chunk[2])])
-            tsm.run(reader, writer)
-    _, alteredAudioData = wavfile.read(eFile)
-    leng = alteredAudioData.shape[0]
-    endPointer = outputPointer+leng
-    outputAudioData.extend((alteredAudioData/maxAudioVolume).tolist())
-
-    # Smoothing the audio
-    if leng < AUDIO_FADE_ENVELOPE_SIZE:
-        for i in range(outputPointer,endPointer):
-            outputAudioData[i] = 0
-    else:
-        for i in range(outputPointer,outputPointer+AUDIO_FADE_ENVELOPE_SIZE):
-            outputAudioData[i][0]*=mask[i-outputPointer]
-            outputAudioData[i][1]*=mask[i-outputPointer]
-        for i in range(endPointer-AUDIO_FADE_ENVELOPE_SIZE, endPointer):
-            outputAudioData[i][0]*=(1-mask[i-endPointer+AUDIO_FADE_ENVELOPE_SIZE])
-            outputAudioData[i][1]*=(1-mask[i-endPointer+AUDIO_FADE_ENVELOPE_SIZE])
-
-    startOutputFrame = int(math.ceil(outputPointer/samplesPerFrame))
-    endOutputFrame = int(math.ceil(endPointer/samplesPerFrame))
-    for outputFrame in range(startOutputFrame, endOutputFrame):
-        inputFrame = int(chunk[0]+NEW_SPEED[int(chunk[2])]*(outputFrame-startOutputFrame))
-        didItWork = copyFrame(inputFrame,outputFrame)
-        if didItWork:
-            lastExistingFrame = inputFrame
-        else:
-            copyFrame(lastExistingFrame,outputFrame)
-
-    outputPointer = endPointer
-
-outputAudioData =  np.asarray(outputAudioData)
-wavfile.write(TEMP_FOLDER+"/audioNew.wav",SAMPLE_RATE,outputAudioData)
-
-
-command = f"ffmpeg -framerate {frameRate} -i {TEMP_FOLDER}/newFrame%06d.jpg -i {TEMP_FOLDER}/audioNew.wav -strict -2 -c:v libx264 -preset {H264_PRESET} -crf {H264_CRF} -pix_fmt yuvj420p '{OUTPUT_FILE}'"
-subprocess.call(command, shell=True)
-
-deletePath(TEMP_FOLDER)
+deletePath(tempDir)
 
